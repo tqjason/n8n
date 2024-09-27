@@ -26,7 +26,7 @@ import type {
 import type PCancelable from 'p-cancelable';
 
 import type { ActiveWorkflowManager } from '@/active-workflow-manager';
-import type { AnnotationTagEntity } from '@/databases/entities/annotation-tag-entity';
+import type { AnnotationTagEntity } from '@/databases/entities/annotation-tag-entity.ee';
 import type { AuthProviderType } from '@/databases/entities/auth-identity';
 import type { SharedCredentials } from '@/databases/entities/shared-credentials';
 import type { TagEntity } from '@/databases/entities/tag-entity';
@@ -193,7 +193,8 @@ export interface IExecutionsCurrentSummary {
 export interface IExecutingWorkflowData {
 	executionData: IWorkflowExecutionDataProcess;
 	startedAt: Date;
-	postExecutePromises: Array<IDeferredPromise<IRun | undefined>>;
+	/** This promise rejects when the execution is stopped. When the execution finishes (successfully or not), the promise resolves. */
+	postExecutePromise: IDeferredPromise<IRun | undefined>;
 	responsePromise?: IDeferredPromise<IExecuteResponsePromiseData>;
 	workflowExecution?: PCancelable<IRun>;
 	status: ExecutionStatus;
