@@ -232,6 +232,7 @@ describe('GlobalConfig', () => {
 			launcherPath: '',
 			launcherRunner: 'javascript',
 			maxOldSpaceSize: '',
+			maxConcurrency: 5,
 		},
 		sentry: {
 			backendDsn: '',
@@ -264,6 +265,11 @@ describe('GlobalConfig', () => {
 			activationKey: '',
 			tenantId: 1,
 			cert: '',
+		},
+		security: {
+			restrictFileAccessTo: '',
+			blockFileAccessToN8nFiles: true,
+			daysAbandonedWorkflow: 90,
 		},
 	};
 
