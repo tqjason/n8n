@@ -1,4 +1,4 @@
-import type { ListDataStoreContentQueryDto, DataTableFilter } from '@n8n/api-types';
+import { ListDataStoreContentQueryDto, DataTableFilter } from '@n8n/api-types';
 import { CreateTable, DslColumn } from '@n8n/db';
 import { Service } from '@n8n/di';
 import {
@@ -9,6 +9,8 @@ import {
 	UpdateQueryBuilder,
 	In,
 	ObjectLiteral,
+	EntityManager,
+	DeleteQueryBuilder,
 } from '@n8n/typeorm';
 import {
 	DataStoreColumnJsType,
@@ -154,6 +156,7 @@ export class DataStoreRowsRepository {
 		table: DataStoreUserTableName,
 		rows: DataStoreRows,
 		columns: DataTableColumn[],
+		em: EntityManager,
 	) {
 		// DB systems have different maximum parameters per query
 		// with old sqlite versions having the lowest in 999 parameters
@@ -186,11 +189,7 @@ export class DataStoreRowsRepository {
 				completeRows[j - start] = insertArray;
 			}
 
-			const query = this.dataSource
-				.createQueryBuilder()
-				.insert()
-				.into(table, columnNames)
-				.values(completeRows);
+			const query = em.createQueryBuilder().insert().into(table, columnNames).values(completeRows);
 			await query.execute();
 			insertedRows += completeRows.length;
 		}
@@ -202,13 +201,16 @@ export class DataStoreRowsRepository {
 		rows: DataStoreRows,
 		columns: DataTableColumn[],
 		returnType: T,
+		em?: EntityManager,
 	): Promise<DataTableInsertRowsResult<T>>;
 	async insertRows<T extends DataTableInsertRowsReturnType>(
 		dataStoreId: string,
 		rows: DataStoreRows,
 		columns: DataTableColumn[],
 		returnType: T,
+		em?: EntityManager,
 	): Promise<DataTableInsertRowsResult> {
+		em = em ?? this.dataSource.manager;
 		const inserted: Array<Pick<DataStoreRowReturn, 'id'>> = [];
 		const dbType = this.dataSource.options.type;
 		const useReturning = dbType === 'postgres' || dbType === 'mariadb';
@@ -221,7 +223,7 @@ export class DataStoreRowsRepository {
 		const selectColumns = [...escapedSystemColumns, ...escapedColumns];
 
 		if (returnType === 'count') {
-			return await this.insertRowsBulk(table, rows, columns);
+			return await this.insertRowsBulk(table, rows, columns, em);
 		}
 
 		// We insert one by one as the default behavior of returning the last inserted ID
@@ -238,7 +240,7 @@ export class DataStoreRowsRepository {
 				completeRow[column.name] = normalizeValue(completeRow[column.name], column.type, dbType);
 			}
 
-			const query = this.dataSource.createQueryBuilder().insert().into(table).values(completeRow);
+			const query = em.createQueryBuilder().insert().into(table).values(completeRow);
 
 			if (useReturning) {
 				query.returning(returnType === 'all' ? selectColumns.join(',') : 'id');
@@ -266,7 +268,7 @@ export class DataStoreRowsRepository {
 				continue;
 			}
 
-			const insertedRows = await this.getManyByIds(dataStoreId, ids, columns);
+			const insertedRows = await this.getManyByIds(dataStoreId, ids, columns, em);
 
 			inserted.push(...insertedRows);
 		}
@@ -274,13 +276,23 @@ export class DataStoreRowsRepository {
 		return inserted;
 	}
 
+	async updateRow<T extends boolean | undefined>(
+		dataStoreId: string,
+		data: Record<string, DataStoreColumnJsType | null>,
+		filter: DataTableFilter,
+		columns: DataTableColumn[],
+		returnData?: T,
+		em?: EntityManager,
+	): Promise<T extends true ? DataStoreRowReturn[] : true>;
 	async updateRow(
 		dataStoreId: string,
 		data: Record<string, DataStoreColumnJsType | null>,
 		filter: DataTableFilter,
 		columns: DataTableColumn[],
 		returnData: boolean = false,
+		em?: EntityManager,
 	) {
+		em = em ?? this.dataSource.manager;
 		const dbType = this.dataSource.options.type;
 		const useReturning = dbType === 'postgres';
 
@@ -302,17 +314,14 @@ export class DataStoreRowsRepository {
 		if (!useReturning && returnData) {
 			// Only Postgres supports RETURNING statement on updates (with our typeorm),
 			// on other engines we must query the list of updates rows later by ID
-			const selectQuery = this.dataSource
-				.createQueryBuilder()
-				.select('id')
-				.from(table, 'dataTable');
+			const selectQuery = em.createQueryBuilder().select('id').from(table, 'dataTable');
 			this.applyFilters(selectQuery, filter, 'dataTable', columns);
 			affectedRows = await selectQuery.getRawMany<{ id: number }>();
 		}
 
 		setData.updatedAt = normalizeValue(new Date(), 'date', dbType);
 
-		const query = this.dataSource.createQueryBuilder().update(table);
+		const query = em.createQueryBuilder().update(table);
 		// Some DBs (like SQLite) don't allow using table aliases as column prefixes in UPDATE statements
 		this.applyFilters(query, filter, undefined, columns);
 		query.set(setData);
@@ -332,24 +341,68 @@ export class DataStoreRowsRepository {
 		}
 
 		const ids = affectedRows.map((row) => row.id);
-		return await this.getManyByIds(dataStoreId, ids, columns);
+		return await this.getManyByIds(dataStoreId, ids, columns, em);
 	}
 
-	async deleteRows(dataStoreId: string, ids: number[]) {
-		if (ids.length === 0) {
+	async deleteRows(
+		dataTableId: string,
+		columns: DataTableColumn[],
+		filter: DataTableFilter | undefined,
+		returnData: boolean = false,
+	) {
+		const dbType = this.dataSource.options.type;
+		const useReturning = dbType === 'postgres';
+		const table = toTableName(dataTableId);
+
+		if (!returnData) {
+			// Just delete and return true
+			await this.dataSource.manager.transaction(async (em) => {
+				const query = em.createQueryBuilder().delete().from(table, 'dataTable');
+				if (filter) {
+					this.applyFilters(query, filter, undefined, columns);
+				}
+				await query.execute();
+			});
 			return true;
 		}
 
-		const table = toTableName(dataStoreId);
+		let affectedRows: DataStoreRowReturn[] = [];
 
-		await this.dataSource
-			.createQueryBuilder()
-			.delete()
-			.from(table, 'dataTable')
-			.where({ id: In(ids) })
-			.execute();
+		await this.dataSource.manager.transaction(async (em) => {
+			if (!useReturning) {
+				const selectQuery = em.createQueryBuilder().select('*').from(table, 'dataTable');
 
-		return true;
+				if (filter) {
+					this.applyFilters(selectQuery, filter, 'dataTable', columns);
+				}
+
+				const rawRows = await selectQuery.getRawMany<DataStoreRowReturn>();
+				affectedRows = normalizeRows(rawRows, columns);
+			}
+
+			const query = em.createQueryBuilder().delete().from(table, 'dataTable');
+
+			if (useReturning) {
+				const escapedColumns = columns.map((c) => this.dataSource.driver.escape(c.name));
+				const escapedSystemColumns = DATA_TABLE_SYSTEM_COLUMNS.map((x) =>
+					this.dataSource.driver.escape(x),
+				);
+				const selectColumns = [...escapedSystemColumns, ...escapedColumns];
+				query.returning(selectColumns.join(','));
+			}
+
+			if (filter) {
+				this.applyFilters(query, filter, undefined, columns);
+			}
+
+			const result = await query.execute();
+
+			if (useReturning) {
+				affectedRows = normalizeRows(extractReturningData(result.raw), columns);
+			}
+		});
+
+		return affectedRows;
 	}
 
 	async createTableWithColumns(
@@ -391,8 +444,10 @@ export class DataStoreRowsRepository {
 		dataStoreId: string,
 		dto: ListDataStoreContentQueryDto,
 		columns?: DataTableColumn[],
+		em?: EntityManager,
 	) {
-		const [countQuery, query] = this.getManyQuery(dataStoreId, dto, columns);
+		em = em ?? this.dataSource.manager;
+		const [countQuery, query] = this.getManyQuery(dataStoreId, dto, em, columns);
 		const data: DataStoreRowsReturn = await query.select('*').getRawMany();
 		const countResult = await countQuery.select('COUNT(*) as count').getRawOne<{
 			count: number | string | null;
@@ -402,7 +457,12 @@ export class DataStoreRowsRepository {
 		return { count: count ?? -1, data };
 	}
 
-	async getManyByIds(dataStoreId: string, ids: number[], columns: DataTableColumn[]) {
+	async getManyByIds(
+		dataStoreId: string,
+		ids: number[],
+		columns: DataTableColumn[],
+		em: EntityManager,
+	) {
 		const table = toTableName(dataStoreId);
 		const escapedColumns = columns.map((c) => this.dataSource.driver.escape(c.name));
 		const escapedSystemColumns = DATA_TABLE_SYSTEM_COLUMNS.map((x) =>
@@ -414,7 +474,7 @@ export class DataStoreRowsRepository {
 			return [];
 		}
 
-		const updatedRows = await this.dataSource
+		const updatedRows = await em
 			.createQueryBuilder()
 			.select(selectColumns)
 			.from(table, 'dataTable')
@@ -424,18 +484,13 @@ export class DataStoreRowsRepository {
 		return normalizeRows(updatedRows, columns);
 	}
 
-	async getRowIds(dataStoreId: string, dto: ListDataStoreContentQueryDto) {
-		const [_, query] = this.getManyQuery(dataStoreId, dto);
-		const result = await query.select('dataStore.id').getRawMany<number>();
-		return result;
-	}
-
 	private getManyQuery(
 		dataStoreId: string,
 		dto: ListDataStoreContentQueryDto,
+		em: EntityManager,
 		columns?: DataTableColumn[],
 	): [QueryBuilder, QueryBuilder] {
-		const query = this.dataSource.createQueryBuilder();
+		const query = em.createQueryBuilder();
 
 		const tableReference = 'dataTable';
 		query.from(toTableName(dataStoreId), tableReference);
@@ -450,7 +505,7 @@ export class DataStoreRowsRepository {
 	}
 
 	private applyFilters<T extends ObjectLiteral>(
-		query: SelectQueryBuilder<T> | UpdateQueryBuilder<T>,
+		query: SelectQueryBuilder<T> | UpdateQueryBuilder<T> | DeleteQueryBuilder<T>,
 		filter: DataTableFilter,
 		tableReference?: string,
 		columns?: DataTableColumn[],
@@ -463,11 +518,17 @@ export class DataStoreRowsRepository {
 			getConditionAndParams(filter, i, dbType, tableReference, columns),
 		);
 
-		for (const [condition, params] of conditionsAndParams) {
-			if (filterType === 'or') {
-				query.orWhere(condition, params);
-			} else {
-				query.andWhere(condition, params);
+		if (conditionsAndParams.length === 1) {
+			// Always use AND for a single filter
+			const [condition, params] = conditionsAndParams[0];
+			query.andWhere(condition, params);
+		} else {
+			for (const [condition, params] of conditionsAndParams) {
+				if (filterType === 'or') {
+					query.orWhere(condition, params);
+				} else {
+					query.andWhere(condition, params);
+				}
 			}
 		}
 	}
@@ -488,7 +549,7 @@ export class DataStoreRowsRepository {
 	}
 
 	private applyPagination(query: QueryBuilder, dto: ListDataStoreContentQueryDto): void {
-		query.skip(dto.skip);
-		query.take(dto.take);
+		query.skip(dto.skip ?? 0);
+		if (dto.take) query.take(dto.take);
 	}
 }
